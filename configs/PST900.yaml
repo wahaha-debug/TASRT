@@ -1,0 +1,79 @@
+DEVICE          : cuda              # device used for training and evaluation (cpu, cuda, cuda0, cuda1, ...)
+SAVE_DIR        : '../output'         # output folder name used for saving the model, logs and inference results
+
+MODEL:
+  NAME          : train                                    # name of the model you are using
+  BACKBONE      : b+       # model variant
+  PRETRAINED    : '/home/wahaha/SAM-segmentation/SAM2_text_T_MFNet/checkpoints/sam2_hiera_base_plus.pt'     # backbone model's weight
+  RESUME: ""
+  MODEL_CONFIG  : './sam2_hiera_b+.yaml'                                                # checkpoint file
+
+DATASET:
+  NAME          : MFNet                         # dataset name to be trained with (camvid, cityscapes, ade20k)
+  ROOT          : './data/PST900'                                   # dataset root path
+  IGNORE_LABEL  : 255
+  # MODALS        : ['img']
+  MODALS        : ['img', 'thermal']
+  RGB_TEXT_JSON : './data/PST900/rgb.json'
+  THERMAL_TEXT_JSON : './data/PST900/thermal.json'
+  
+TRAIN:
+  IMAGE_SIZE    : [1280, 1280]      # training image size in (h, w)
+  BATCH_SIZE    : 2          # batch size used to train
+  EPOCHS        : 1000             # number of epochs to train
+  EVAL_START    : 60             # evaluation interval during training
+  EVAL_INTERVAL : 1               # evaluation interval during training
+  AMP           : true           # use AMP in training
+  DDP           : false            # use DDP training
+  RANK          : 16
+  NUM_EXPERTS   : 4 
+  TOP_K: 2              
+  SWITCH_EPOCH_TO_TRAIN2: 10      
+
+LOSS:
+  NAME          : CrossEntropy     # loss function name (ohemce, ce, dice)
+  CLS_WEIGHTS   : false            # use class weights in loss calculation
+
+  LAMBDA_FINAL: 1
+  LB_WARMUP_EPOCHS: 40            # warmup epochs for load-balance loss
+  LAMBDA_RGB: 0.4   
+  LAMBDA_THERMAL: 0.4
+  LAMBDA_STRUCTURE: 0.6
+  LAMBDA_LB: 0.005
+  LAMBDA_LANGUAGE: 0.02
+  LANG_WARMUP_EPOCHS: 120          # warmup epochs for language align loss
+
+OPTIMIZER:
+  NAME          : adamw           # optimizer name
+  LR            : 0.00007       # initial learning rate used in optimizer
+  WEIGHT_DECAY  : 0.01            # decay rate used in optimizer
+  BACKBONE_LR_CAP: 0.00007         # cap for backbone group learning rate 目的: 防止backbone学习率过高
+  GRAD_CLIP_NORM: 1.0             # gradient clipping max norm
+
+  LR_MULTIPLIERS:                 # per-group lr multipliers (relative to base LR)
+    BACKBONE: 1.00
+    LORA: 1.00
+    ROUTER_HEAD: 0.9
+    TEXT: 0.25
+    OTHERS: 1.00
+
+  LR_MULT_ROUTER_BRANCH:
+    RGB: null
+    TH: null
+
+SCHEDULER:
+  NAME          : warmuppolylr    # scheduler name
+  POWER         : 0.9             # scheduler power
+  WARMUP        : 15              # warmup epochs used in scheduler
+  WARMUP_RATIO  : 0.1             # warmup ratio
+
+EVAL:
+  MODEL_PATH    : '/home/wahaha/SAM-segmentation/SAM2_text_T_PST900/output/train_b+_PST900_epoch232_89.16.pth'
+  IMAGE_SIZE    : [1280, 1280]      # evaluation image size in (h, w)
+  BATCH_SIZE    : 1              # batch size used to train
+  BATCH_SIZE_VIS: 1                                      # batch size
+  VIS_SAVE_DIR: '/home/wahaha/SAM-segmentation/SAM2_text_T_PST900/VIS_result'              # Where to save visualization
+  MSF: 
+    ENABLE      : false                                   # multi-scale and flip evaluation  
+    FLIP        : true                                    # use flip in evaluation
+    SCALES      : [0.5, 0.75, 1.0, 1.25, 1.5, 1.75]       # scales used in MSF evaluation                
