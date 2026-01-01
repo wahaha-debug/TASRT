@@ -164,23 +164,20 @@ class DSCSE(nn.Module):
         return torch.stack(outs, dim=0).mean(0) 
 
     def forward(self, rgb, th):
-        # queries 来自各自模态
         q_rgb = self.q_proj(rgb)
         q_th  = self.q_proj(th)
 
         k_rgb, v_rgb = torch.chunk(self.kv_proj_rgb(rgb), 2, dim=1) 
         k_th,  v_th  = torch.chunk(self.kv_proj_th(th),  2, dim=1)
 
-        # 变形采样，缓解配准误差
-        v_rgb2th = self._sample(v_rgb, self.offset_rgb2th(th)) # 变形采样，缓解配准误差
+        v_rgb2th = self._sample(v_rgb, self.offset_rgb2th(th)) 
         v_th2rgb = self._sample(v_th,  self.offset_th2rgb(rgb))
 
-        # 简化版 cross-attn（点乘注意力可替换为门控/卷积注意力）
         attn_rgb = torch.sigmoid(q_rgb) * v_th2rgb
         attn_th  = torch.sigmoid(q_th)  * v_rgb2th
 
         fused = self.out(torch.cat([attn_rgb, attn_th], dim=1))
-        return self.norm(fused + 0.5*(rgb + th))  # 残差 + 双模态先验
+        return self.norm(fused + 0.5*(rgb + th))  
 
 
 class _LoRA_qkv(nn.Module):
@@ -201,11 +198,11 @@ class _LoRA_qkv(nn.Module):
             linear_b_v3: nn.Module = None,  # Second LoRA module
     ):
         super().__init__()
-        self.qkv = qkv  # 输入的qkv线性层
-        self.linear_a_q = linear_a_q  # 用于Q的低秩适配A
-        self.linear_b_q = linear_b_q  # 用于Q的低秩适配B
-        self.linear_a_v = linear_a_v  # 用于V的低秩适配A
-        self.linear_b_v = linear_b_v  # 用于V的低秩适配B
+        self.qkv = qkv 
+        self.linear_a_q = linear_a_q  
+        self.linear_b_q = linear_b_q  
+        self.linear_a_v = linear_a_v 
+        self.linear_b_v = linear_b_v  
 
         self.linear_a_q2 = linear_a_q2
         self.linear_b_q2 = linear_b_q2
@@ -220,11 +217,11 @@ class _LoRA_qkv(nn.Module):
         self.dim = qkv.in_features
 
     def forward(self, x):
-        qkv = self.qkv(x)  # 原始QKV计算
-        new_q = self.linear_b_q(self.linear_a_q(x))  # 计算低秩适配后的Q
-        new_v = self.linear_b_v(self.linear_a_v(x))  # 计算低秩适配后的V
-        qkv[:, :, :, : self.dim] += new_q  # 将低秩Q加到原始Q部分
-        qkv[:, :, :, -self.dim:] += new_v  # 将低秩V加到原始V部分
+        qkv = self.qkv(x)  
+        new_q = self.linear_b_q(self.linear_a_q(x))  
+        new_v = self.linear_b_v(self.linear_a_v(x))  
+        qkv[:, :, :, : self.dim] += new_q 
+        qkv[:, :, :, -self.dim:] += new_v 
 
         
         # Apply the second LoRA module if they exist
@@ -265,10 +262,10 @@ class TopKRouter(nn.Module):
         # x: (B, C, H, W)
         h = self.pool(x)                    # (B, C, 1, 1)
         logits = self.fc(h).flatten(1)      # (B, num_experts)
-        probs = torch.softmax(logits, dim=1)  # (B, num_experts) 目的：将logits转换为概率， 其中logits是
+        probs = torch.softmax(logits, dim=1)  
         k = min(self.k, probs.size(1))
         topk_val, topk_idx = torch.topk(probs, k=k, dim=1)  # (B, k), (B, k)
-        return topk_idx, topk_val, probs  # probs是概率,作用: 用于负载均衡损失计算。 topk_idx是索引, topk_val是值
+        return topk_idx, topk_val, probs  
 
 
 
@@ -289,41 +286,32 @@ class SparseMoE(nn.Module):
             ) for _ in range(num_experts)
         ])
         self.router = TopKRouter(input_dim, num_experts, k)
-        # 可选：指示该 MoE 属于哪一路（'rgb' 或 'th'），用于双文本路由
         self.text_side = None
 
-    def forward(self, x): # 做了两次路由
-        # 第一次路由：根据输入特征 x 和文本特征 text_cls 计算每个样本对每个专家的权重，对输入特征图x进行路由（选择 top-k 个专家）；
-        # x: (B, C, H, W)
-        # 路由：兼容默认 TopKRouter 与 AdaptiveTopKRouterDualText
+    def forward(self, x):
 
-        topk_idx, topk_w, probs = self.router(x) #1. 路由选择：确定每个样本该用哪些专家
+
+        topk_idx, topk_w, probs = self.router(x) 
         B, C, H, W = x.shape
-        E = self.num_experts  # 专家个数
+        E = self.num_experts  
 
-        #2. 构造路由权重：每个样本对专家的总权重，用于后续选择专家；构造每个样本对各专家的权重 (B, E)，仅 Top-k 为非零  让选中的专家网络处理对应样本；
-        routing_weights = F.one_hot(topk_idx, num_classes=E).to(x.dtype)  # (B, k, E)  one_hot 作用: 将topk_idx转换为one-hot编码
-        routing_weights = routing_weights * topk_w.unsqueeze(-1)  # (B, k, E)  topk_w.unsqueeze(-1) 作用: 将topk_w扩展为(B, k, 1)
-        routing_weights = routing_weights.sum(dim=1)  # (B, E)  sum(dim=1) 作用: 将topk_w扩展为(B, E)
+        routing_weights = F.one_hot(topk_idx, num_classes=E).to(x.dtype)  
+        routing_weights = routing_weights * topk_w.unsqueeze(-1)  
+        routing_weights = routing_weights.sum(dim=1)  
 
-        #3. 专家网络计算：每个专家处理被分配的样本，输出特征图；
-        # 第二次路由：根据权重 routing_weights 选择每个样本的专家
-        # 按专家维度循环（E 通常较小），对被选中的样本批量计算并聚合
-        y = torch.zeros_like(x) #  torch.Size([4, 2048, 40, 40]) 构建一个与x形状相同的张量，并将其初始化为0，用于存储每个专家的输出
-        # print(y.shape)
-        selected_mask = routing_weights > 0  # (B, E)  selected_mask 作用: 选择被选中的专家 （每个样本的专家权重大于0）  4*8
+        y = torch.zeros_like(x)
+        selected_mask = routing_weights > 0  
         for i in range(E):
-            idx_b = selected_mask[:, i].nonzero(as_tuple=False).squeeze(1) #  torch.Size([4, 1]) 作用: 选择被选中的专家 （每个样本的专家权重大于0）  【4，1】
+            idx_b = selected_mask[:, i].nonzero(as_tuple=False).squeeze(1) 
             if idx_b.numel() == 0:
                 continue
-            x_i = x.index_select(0, idx_b)  # (n_i, C, H, W) 作用: 选择被选中的专家 （每个样本的专家权重大于0）  【4，2048，40，40】
-            out_i = self.experts[i](x_i)    # (n_i, C, H, W) 作用: 选择被选中的专家 （每个样本的专家权重大于0）  【4，2048，40，40】
-            w_i = routing_weights.index_select(0, idx_b)[:, i].view(-1, 1, 1, 1)  #  torch.Size([4, 1, 1, 1]) 作用: 选择被选中的专家 （每个样本的专家权重大于0）  【4，1，1，1】
+            x_i = x.index_select(0, idx_b)  
+            out_i = self.experts[i](x_i)    
+            w_i = routing_weights.index_select(0, idx_b)[:, i].view(-1, 1, 1, 1) 
             y[idx_b] += out_i * w_i
             
-        #4. 残差连接与输出
-        out = x + y  # # 残差连接：原始特征 + 专家处理结果
-        return out, probs  # 返回 router 概率用于负载均衡损失
+        out = x + y  
+        return out, probs  
 
 
 class LoRA_Sam(nn.Module):
@@ -346,34 +334,31 @@ class LoRA_Sam(nn.Module):
     def __init__(self, sam_model: SAM2Base, r: int, num_classes: int, lora_layer=None, num_experts: int = 1, top_k: int = 2, text_dim: int = None):
         super(LoRA_Sam, self).__init__()
 
-        assert r > 0  # 确保 LoRA 的秩参数 r 为正数
+        assert r > 0  
         if lora_layer:
-            self.lora_layer = lora_layer  # 使用指定的层
+            self.lora_layer = lora_layer 
         else:
             self.lora_layer = list(range(
-                len(sam_model.image_encoder.trunk.blocks)))  # 默认将 LoRA 应用于所有的 trunk blocks        # Only apply lora to the image encoder by default
+                len(sam_model.image_encoder.trunk.blocks))) 
+        self.w_As = [] 
+        self.w_Bs = [] 
+        self.w_As2 = []  
+        self.w_Bs2 = [] 
+        self.w_As3 = []  
+        self.w_Bs3 = []  
 
-        self.w_As = []  # 第一组 LoRA 层的权重 W_A
-        self.w_Bs = []  # 第一组 LoRA 层的权重 W_B
-        self.w_As2 = []  # 第二组 LoRA 层的权重 W_A
-        self.w_Bs2 = []  # 第二组 LoRA 层的权重 W_B
-        self.w_As3 = []  # 第三组 LoRA 层的权重 W_A
-        self.w_Bs3 = []  # 第三组 LoRA 层的权重 W_B
 
-        # Freeze original SAM model parameters
-        # 冻结原始模型的所有参数
         for param in sam_model.image_encoder.parameters():
             param.requires_grad = False
 
-        # Apply LoRA to specified layers
-        # 遍历图像编码器的每一层
+     
         for t_layer_i, blk in enumerate(sam_model.image_encoder.trunk.blocks):
             if t_layer_i not in self.lora_layer:
-                continue  # 如果该层不在指定的 lora_layer 中，跳过
-            w_qkv_linear = blk.attn.qkv  # 提取该层的 qkv 线性层
-            self.dim = w_qkv_linear.in_features  # 获取线性层的输入维度
+                continue  
+            w_qkv_linear = blk.attn.qkv 
+            self.dim = w_qkv_linear.in_features
 
-            # First LoRA module
+
             w_a_linear_q = nn.Linear(self.dim, r, bias=False)
             w_b_linear_q = nn.Linear(r, self.dim, bias=False)
             w_a_linear_v = nn.Linear(self.dim, r, bias=False)
@@ -403,7 +388,6 @@ class LoRA_Sam(nn.Module):
             self.w_As3.append(w_a_linear_v3)
             self.w_Bs3.append(w_b_linear_v3)
 
-            # 使用 _LoRA_qkv 替换原始 qkv 线性层，使其包含 LoRA 的权重更新逻辑。  _LoRA_qkv -> nn.Module -> object
             blk.attn.qkv = _LoRA_qkv(
                 w_qkv_linear,
                 w_a_linear_q,
@@ -421,42 +405,28 @@ class LoRA_Sam(nn.Module):
                 w_a_linear_v3,
                 w_b_linear_v3
             )
-        self.reset_parameters()  # 调用 reset_parameters 方法，初始化 LoRA 模块的权重（如使用 Kaiming 初始化）。
+        self.reset_parameters() 
         self.sam = sam_model
 
-        # 获取SAM掩码解码器中的Transformer特征维度大小，用于后续MLP和卷积层的输入维度
-        transformer_dim = self.sam.sam_mask_decoder.transformer_dim  # 表示 sam_mask_decoder 的 Transformer 的维度大小。
-
-        # --- 专家分支定义 ---
-        # A. RGB 稀疏MoE专家池
+        transformer_dim = self.sam.sam_mask_decoder.transformer_dim  
         self.rgb_moe = SparseMoE(input_dim=transformer_dim, num_experts=num_experts, k=top_k)
 
-        # B. Thermal 稀疏MoE专家池
         self.thermal_moe = SparseMoE(input_dim=transformer_dim, num_experts=num_experts, k=top_k)
 
-        # C. 增强型跨模态结构专家
         self.DSCSE_expert = DSCSE(dim=transformer_dim, num_heads=8, num_points=4)
 
-        # 融合层（取代原FusionModule）
         self.fuse_conv = nn.Conv2d(transformer_dim * 3, transformer_dim, kernel_size=1)
 
-        # 文本相关模块（即插即用，默认不传文本时不生效）
         proj_in_dim = transformer_dim if text_dim is None else text_dim
         self.dual_text = DualTextProjector(text_dim=proj_in_dim, vis_dim=transformer_dim, max_len=16, dropout=0.1)
         self.tgf_bi    = TokenGuidedFusionBi(vis_dim=transformer_dim, num_heads=8, aux_scale=0.5, reduce_tokens=8)
 
-        self.thermal_moe.text_side = 'th'  # 告诉 SparseMoE 这一路吃 Thermal 文本
-
-        # token + 结构分支的融合
+        self.thermal_moe.text_side = 'th'  
         self.fuse_token_struct = TriBranchSoftmaxFuse(transformer_dim)
 
-        # --- 辅助分割头 ---
         self.aux_head_rgb = nn.Conv2d(transformer_dim, num_classes, kernel_size=1)
         self.aux_head_thermal = nn.Conv2d(transformer_dim, num_classes, kernel_size=1)
         self.aux_head_structure = nn.Conv2d(transformer_dim, num_classes, kernel_size=1)
-        # --- 专家分支定义结束 ---
-
-
 
     def save_lora_parameters(self, filename: str) -> None:
         r"""Only safetensors is supported now.
@@ -466,38 +436,29 @@ class LoRA_Sam(nn.Module):
         save both lora and fc parameters.
         """
 
-        # 确保文件名以 `.pt` 或 `.pth` 结尾，表示支持的保存格式
         assert filename.endswith(".pt") or filename.endswith('.pth')
 
-        # 获取 LoRA 模块的层数（注意：self.w_As 包含多组权重，这里计算层数）
-        num_layer = len(self.w_As)  # 实际上它是 LoRA 的一半层数
-
-        # 将第一组 LoRA 模块的权重保存为字典
+        num_layer = len(self.w_As)  
         a_tensors = {f"w_a_{i:03d}": self.w_As[i].weight for i in range(num_layer)}
         b_tensors = {f"w_b_{i:03d}": self.w_Bs[i].weight for i in range(num_layer)}
 
-        # 用于存储其他模块的参数
-        prompt_encoder_tensors = {}  # 存储 prompt encoder 的参数
-        mask_decoder_tensors = {}  # 存储 mask decoder 的参数
+        prompt_encoder_tensors = {}  # 
+        mask_decoder_tensors = {}  # 
 
-        # 获取模型的 state_dict（支持 DataParallel 和 DistributedDataParallel）
         if isinstance(self.sam, torch.nn.DataParallel) or isinstance(self.sam,
                                                                      torch.nn.parallel.DistributedDataParallel):
-            state_dict = self.sam.module.state_dict()  # 如果是并行模型，获取实际的模块
+            state_dict = self.sam.module.state_dict()  
         else:
-            state_dict = self.sam.state_dict()  # 普通模型直接获取 state_dict
+            state_dict = self.sam.state_dict()  
 
-        # 遍历所有参数，将属于 prompt_encoder 和 mask_decoder 的参数分类存储
         for key, value in state_dict.items():
             if 'prompt_encoder' in key:
-                prompt_encoder_tensors[key] = value  # 保存 prompt encoder 参数
+                prompt_encoder_tensors[key] = value  
             if 'mask_decoder' in key:
-                mask_decoder_tensors[key] = value  # 保存 mask decoder 参数
+                mask_decoder_tensors[key] = value  
 
-        # 合并所有参数，包括 LoRA 参数和其他模块参数
         merged_dict = {**a_tensors, **b_tensors, **prompt_encoder_tensors, **mask_decoder_tensors}
 
-        # 使用 safetensors 库保存参数到指定文件
         save_file(merged_dict, filename)
 
     def reset_parameters(self):
@@ -522,69 +483,51 @@ class LoRA_Sam(nn.Module):
 
 
     def forward(self, batched_input, multimask_output, text_tokens_rgb: torch.Tensor = None, text_tokens_th: torch.Tensor = None):
-        # batched_input 是一个包含 [rgb_batch, thermal_batch] 的列表
-        # 每个张量的形状为 (b, 3, h, w)
-        b = batched_input[0].shape[0]  # 原始批次大小
-        m = len(batched_input)  # 模态数量 (m=2)
 
-        # 沿批次维度拼接，以适应共享骨干网络
-        stacked_images = torch.cat(batched_input, dim=0)  # 新形状: (m*b, 3, h, w)
-
-        # 第1步：共享骨干网络与特征提取
+        b = batched_input[0].shape[0]  
+        m = len(batched_input)  
+        stacked_images = torch.cat(batched_input, dim=0)  
         image_embedding = self.sam.forward_image(stacked_images)
 
-        vision_features = image_embedding['vision_features']  # 形状: (m*b, C, fH, fW)
+        vision_features = image_embedding['vision_features'] 
         _, C, fH, fW = vision_features.shape
-        vision_features = vision_features.view(m, b, C, fH, fW)  # 重塑以分离模态
-
-        # 将特征分离为 RGB 和 Thermal
+        vision_features = vision_features.view(m, b, C, fH, fW) 
         rgb_features = vision_features[0]  # (b, C, fH, fW)
         thermal_features = vision_features[1]  # (b, C, fH, fW)
 
-        # 文本投影与双路 Token 引导（若无文本输入将得到 None 分支）
         Tq_rgb, Tq_th = self.dual_text(text_tokens_rgb, text_tokens_th)
         F_rTok, F_tTok, _ = self.tgf_bi(rgb_features, thermal_features, Tq_rgb, Tq_th)
 
-        # 稀疏 MoE 专家池（传入对应文本 cls 到路由器）
         F_rgb_expert, rgb_router_probs = self.rgb_moe(rgb_features)
         F_thermal_expert, thermal_router_probs = self.thermal_moe(thermal_features)
-        # 结构分支
         F_structure = self.DSCSE_expert(rgb_features, thermal_features)
-        # 融合：token+结构 再与两路专家融合，保持 3C 输入到 fuse_conv
         zero = torch.zeros_like(rgb_features)
         F_rTok = F_rTok if F_rTok is not None else zero
         F_tTok = F_tTok if F_tTok is not None else zero
         F_token_struct = self.fuse_token_struct(F_rTok, F_tTok, F_structure)
         fused_features = self.fuse_conv(torch.cat([F_rgb_expert, F_thermal_expert, F_token_struct], dim=1))
 
-        # --- 关键修复：处理高分辨率FPN特征以匹配融合后的批次大小 ---
         fpn_features = image_embedding['backbone_fpn']
         processed_high_res_features = []
-        for feat in fpn_features[:2]:  # 只处理解码器需要的 feat_s0 和 feat_s1
-            # 将 (m*b, C, H, W) 重塑为 (m, b, C, H, W) 并对模态维度(m)求平均
+        for feat in fpn_features[:2]: 
             _, C_fpn, H_fpn, W_fpn = feat.shape
             feat_avg = feat.view(m, b, C_fpn, H_fpn, W_fpn).mean(dim=0)
             processed_high_res_features.append(feat_avg)
-        # --- FPN特征处理结束 ---
-
-        # 通过 SAM 解码器生成分割掩码和其他特征
+    
         multi_mask_output = self.sam._forward_sam_heads(
-            fused_features,  # 使用最终融合后的特征 (b, C, fH, fW)
-            high_res_features=processed_high_res_features,  # 使用处理后、批次大小匹配的高分特征
+            fused_features,  
+            high_res_features=processed_high_res_features,  
             multimask_output=multimask_output
         )
 
         final_output = multi_mask_output[1]
 
-        # --- 关键修复：上采样所有输出以匹配标签尺寸 ---
-        # 从输入图像获取目标上采样尺寸
+  
         target_size = batched_input[0].shape[-2:]
 
-        # 上采样主输出
         final_output_upsampled = F.interpolate(final_output, size=target_size, mode='bilinear', align_corners=False)
 
         if self.training:
-            # --- 计算并上采样辅助损失的输出 ---
             rgb_output = self.aux_head_rgb(F_rgb_expert)
             thermal_output = self.aux_head_thermal(F_thermal_expert)
             structure_output = self.aux_head_structure(F_structure)
@@ -592,7 +535,6 @@ class LoRA_Sam(nn.Module):
             rgb_output_upsampled = F.interpolate(rgb_output, size=target_size, mode='bilinear', align_corners=False)
             thermal_output_upsampled = F.interpolate(thermal_output, size=target_size, mode='bilinear', align_corners=False)
             structure_output_upsampled = F.interpolate(structure_output, size=target_size, mode='bilinear', align_corners=False)
-            # 语言-视觉对齐的可选辅助损失（无文本时为0）
             language_align_loss = torch.tensor(0.0, device=final_output_upsampled.device)
 
             return {
@@ -603,8 +545,7 @@ class LoRA_Sam(nn.Module):
                 "language_align_loss": language_align_loss,
             }
         else:
-            # 在评估模式下，只返回上采样后的最终输出
-            # 先前的 reshape 和 mean 操作不适用于当前架构
+    
             return final_output_upsampled
 
 
